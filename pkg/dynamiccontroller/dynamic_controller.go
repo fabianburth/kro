@@ -73,6 +73,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -124,9 +125,9 @@ type DynamicController struct {
 
 	// kubeClient is the dynamic client used to create the informers
 	kubeClient dynamic.Interface
-	// informers is a safe map of GVR to informers. Each informer is responsible
-	// for watching a specific GVR.
-	informers sync.Map
+
+	// informerFactory provides access to shared informers for each GVR.
+	informerFactory dynamicinformer.DynamicSharedInformerFactory
 
 	// handlers is a safe map of GVR to workflow operators. Each
 	// handler is responsible for managing a specific GVR.
@@ -152,9 +153,22 @@ func NewDynamicController(
 	kubeClient dynamic.Interface) *DynamicController {
 	logger := log.WithName("dynamic-controller")
 
+	// Create a new informer
+	dynamicSharedInformerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(
+		kubeClient,
+		config.ResyncPeriod,
+		// Maybe we can make this configurable in the future. Thinking that
+		// we might want to filter out some resources, by namespace or labels
+		"",
+		nil,
+	)
+
 	dc := &DynamicController{
-		config:     config,
-		kubeClient: kubeClient,
+		config: config,
+		// TODO(fabianburth): replace this client with a cached client, only the shared informers
+		//  created by the informerFactory should have access to the kubeClient.
+		kubeClient:      kubeClient,
+		informerFactory: dynamicSharedInformerFactory,
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.NewTypedMaxOfRateLimiter(
 			workqueue.NewTypedItemExponentialFailureRateLimiter[ObjectIdentifiers](config.MinRetryDelay, config.MaxRetryDelay),
 			&workqueue.TypedBucketRateLimiter[ObjectIdentifiers]{Limiter: rate.NewLimiter(rate.Limit(config.RateLimit), config.BurstLimit)},
@@ -199,13 +213,15 @@ func (dc *DynamicController) AllInformerHaveSynced() bool {
 
 // WaitForInformerSync waits for all informers to sync or timeout
 func (dc *DynamicController) WaitForInformersSync(stopCh <-chan struct{}) bool {
-	dc.log.V(1).Info("Waiting for all informers to sync")
-	start := time.Now()
-	defer func() {
-		dc.log.V(1).Info("Finished waiting for informers to sync", "duration", time.Since(start))
-	}()
-
-	return cache.WaitForCacheSync(stopCh, dc.AllInformerHaveSynced)
+	syncedMap := dc.informerFactory.WaitForCacheSync(stopCh)
+	for gvr, synced := range syncedMap {
+		if !synced {
+			dc.log.Error(nil, "Informer for GVR not synced", "gvr", gvr)
+			return false
+		}
+		dc.log.V(1).Info("Informer synced", "gvr", gvr)
+	}
+	return true
 }
 
 // Run starts the DynamicController.
@@ -426,9 +442,9 @@ func (dc *DynamicController) enqueueObject(obj interface{}, eventType string) {
 func (dc *DynamicController) StartServingGVK(ctx context.Context, gvr schema.GroupVersionResource, handler Handler) error {
 	dc.log.V(1).Info("Registering new GVK", "gvr", gvr)
 
-	_, exists := dc.informers.Load(gvr)
+	_, exists := dc.handlers.Load(gvr)
 	if exists {
-		// Even thought the informer is already registered, we should still
+		// Even though the gvr is already being served, we should still
 		// update the handler, as it might have changed.
 		dc.handlers.Store(gvr, handler)
 		// trigger reconciliation of the corresponding gvr's
@@ -443,15 +459,7 @@ func (dc *DynamicController) StartServingGVK(ctx context.Context, gvr schema.Gro
 	}
 
 	// Create a new informer
-	gvkInformer := dynamicinformer.NewFilteredDynamicSharedInformerFactory(
-		dc.kubeClient,
-		dc.config.ResyncPeriod,
-		// Maybe we can make this configurable in the future. Thinking that
-		// we might want to filter out some resources, by namespace or labels
-		"",
-		nil,
-	)
-	informer := gvkInformer.ForResource(gvr).Informer()
+	informer := dc.informerFactory.ForResource(gvr).Informer()
 
 	// Set up event handlers
 	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -469,7 +477,6 @@ func (dc *DynamicController) StartServingGVK(ctx context.Context, gvr schema.Gro
 		dc.log.Error(err, "Failed to set watch error handler", "gvr", gvr)
 		return fmt.Errorf("failed to set watch error handler for GVR %s: %w", gvr, err)
 	}
-	dc.handlers.Store(gvr, handler)
 
 	informerContext := context.Background()
 	cancelableContext, cancel := context.WithCancel(informerContext)
@@ -492,8 +499,10 @@ func (dc *DynamicController) StartServingGVK(ctx context.Context, gvr schema.Gro
 		return fmt.Errorf("failed to sync informer cache for GVR %s", gvr)
 	}
 
+	dc.handlers.Store(gvr, handler)
+
 	dc.informers.Store(gvr, &informerWrapper{
-		informer: gvkInformer,
+		informer: sharedInformerFactory,
 		shutdown: cancel,
 	})
 	gvrCount.Inc()
